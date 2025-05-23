@@ -291,119 +291,119 @@ def smooth_bce(eps=0.1):
     return 1.0 - 0.5 * eps, 0.5 * eps
 
 
-class ConfusionMatrix:
-    """
-    A class for calculating and updating a confusion matrix for object detection and classification tasks.
-
-    Attributes:
-        task (str): The type of task, either 'detect' or 'classify'.
-        matrix (np.ndarray): The confusion matrix, with dimensions depending on the task.
-        nc (int): The number of classes.
-        conf (float): The confidence threshold for detections.
-        iou_thres (float): The Intersection over Union threshold.
-    """
-
-    def __init__(self, nc, conf=0.25, iou_thres=0.45, task="detect"):
-        """
-        Initialize a ConfusionMatrix instance.
-
-        Args:
-            nc (int): Number of classes.
-            conf (float, optional): Confidence threshold for detections.
-            iou_thres (float, optional): IoU threshold for matching detections to ground truth.
-            task (str, optional): Type of task, either 'detect' or 'classify'.
-        """
-        self.task = task
-        self.matrix = np.zeros((nc + 1, nc + 1)) if self.task == "detect" else np.zeros((nc, nc))
-        self.nc = nc  # number of classes
-        self.conf = 0.25 if conf in {None, 0.001} else conf  # apply 0.25 if default val conf is passed
+    '''
+    this code is the modification of metrics.py which unusually creates the background class, which is completely useless
+    for reaserch academic purposes, as per my work especially
+    
+    this removes that class and makes the whole process for calculation of confusion matrix more 
+    verbose 
+    
+    '''
+    class ConfusionMatrix:
+    def __init__(self, nc, conf=0.25, iou_thres=0.45):
+        self.nc = nc  # Number of classes
+        self.conf = conf
         self.iou_thres = iou_thres
+        self.matrix = np.zeros((nc, nc))
 
-    def process_cls_preds(self, preds, targets):
+    def process_batch(self, detections, labels):
         """
-        Update confusion matrix for classification task.
-
-        Args:
-            preds (Array[N, min(nc,5)]): Predicted class labels.
-            targets (Array[N, 1]): Ground truth class labels.
-        """
-        preds, targets = torch.cat(preds)[:, 0], torch.cat(targets)
-        for p, t in zip(preds.cpu().numpy(), targets.cpu().numpy()):
-            self.matrix[p][t] += 1
-
-    def process_batch(self, detections, gt_bboxes, gt_cls):
-        """
-        Update confusion matrix for object detection task.
+        Updates the confusion matrix for a batch of detections and labels.
 
         Args:
-            detections (Array[N, 6] | Array[N, 7]): Detected bounding boxes and their associated information.
-                                      Each row should contain (x1, y1, x2, y2, conf, class)
-                                      or with an additional element `angle` when it's obb.
-            gt_bboxes (Array[M, 4]| Array[N, 5]): Ground truth bounding boxes with xyxy/xyxyr format.
-            gt_cls (Array[M]): The class labels.
+            detections (torch.Tensor): Predicted boxes (batch, num_det, 6) [x1, y1, x2, y2, conf, cls]
+            labels (torch.Tensor): Ground truth boxes (batch, num_gt, 5) [img_id, cls, x_center, y_center, width, height]
         """
-        if gt_cls.shape[0] == 0:  # Check if labels is empty
-            if detections is not None:
-                detections = detections[detections[:, 4] > self.conf]
-                detection_classes = detections[:, 5].int()
-                for dc in detection_classes:
-                    self.matrix[dc, self.nc] += 1  # false positives
-            return
         if detections is None:
-            gt_classes = gt_cls.int()
+            gt_classes = labels[:, 1].int().cpu().numpy()
             for gc in gt_classes:
-                self.matrix[self.nc, gc] += 1  # background FN
+                self.matrix[gc, gc] += 1  # Count as FN against the correct class
             return
 
-        detections = detections[detections[:, 4] > self.conf]
-        gt_classes = gt_cls.int()
-        detection_classes = detections[:, 5].int()
-        is_obb = detections.shape[1] == 7 and gt_bboxes.shape[1] == 5  # with additional `angle` dimension
-        iou = (
-            batch_probiou(gt_bboxes, torch.cat([detections[:, :4], detections[:, -1:]], dim=-1))
-            if is_obb
-            else box_iou(gt_bboxes, detections[:, :4])
-        )
+        detections = detections[detections[:, 4] > self.conf]  # Filter by confidence
+        pred_classes = detections[:, 5].int().cpu().numpy()
+        pred_boxes = detections[:, :4].cpu().numpy()
 
-        x = torch.where(iou > self.iou_thres)
-        if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
-            if x[0].shape[0] > 1:
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-        else:
-            matches = np.zeros((0, 3))
+        gt_classes = labels[:, 1].int().cpu().numpy()
+        #gt_boxes = labels[:, 2:].cpu().numpy()  # Incorrect, labels are already xywh
+        gt_boxes = np.zeros_like(pred_boxes) # Placeholder, will be filled with converted gt_boxes
+        img_ids = labels[:, 0].int().cpu().numpy()
 
-        n = matches.shape[0] > 0
-        m0, m1, _ = matches.transpose().astype(int)
-        for i, gc in enumerate(gt_classes):
-            j = m0 == i
-            if n and sum(j) == 1:
-                self.matrix[detection_classes[m1[j]], gc] += 1  # correct
+        # Convert YOLO format to x1y1x2y2 for IOU calculation
+        for i in range(len(labels)):
+            img_id = int(labels[i, 0])
+            x_center = labels[i, 2].float().cpu().numpy()
+            y_center = labels[i, 3].float().cpu().numpy()
+            width = labels[i, 4].float().cpu().numpy()
+            height = labels[i, 5].float().cpu().numpy()
+
+            # Original image size (assuming square images for simplicity, adjust if needed)
+            img_size = 896  #  Adjust to the size you used in training
+            x1 = (x_center - width / 2) * img_size
+            y1 = (y_center - height / 2) * img_size
+            x2 = (x_center + width / 2) * img_size
+            y2 = (y_center + height / 2) * img_size
+            gt_boxes[i] = np.array([x1, y1, x2, y2])
+
+
+        for i in range(len(gt_classes)):
+            best_iou = 0
+            best_pred_idx = -1
+            for j in range(len(pred_classes)):
+                iou = self.bbox_iou(pred_boxes[j], gt_boxes[i])
+                if iou > best_iou and pred_classes[j] == gt_classes[i]:
+                    best_iou = iou
+                    best_pred_idx = j
+
+            if best_iou > self.iou_thres:
+                self.matrix[gt_classes[i], pred_classes[best_pred_idx]] += 1  # TP
+                # Remove the matched prediction to avoid double counting
+                pred_classes = np.delete(pred_classes, best_pred_idx)
+                pred_boxes = np.delete(pred_boxes, best_pred_idx, axis=0)
             else:
-                self.matrix[self.nc, gc] += 1  # true background
+                self.matrix[gt_classes[i], gt_classes[i]] += 1  # FN
 
-        for i, dc in enumerate(detection_classes):
-            if not any(m1 == i):
-                self.matrix[dc, self.nc] += 1  # predicted background
+        # Remaining predictions are FP
+        for pc in pred_classes:
+            self.matrix[pc, pc] += 1  # FP
+
+    def bbox_iou(self, box1, box2):
+        """Calculates the intersection-over-union of two bounding boxes."""
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2
+
+        inter_x1 = max(b1_x1, b2_x1)
+        inter_y1 = max(b1_y1, b2_y1)
+        inter_x2 = min(b1_x2, b2_x2)
+        inter_y2 = min(b1_y2, b2_y2)
+
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        box1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+        box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+
+        iou = inter_area / (box1_area + box2_area - inter_area + 1e-16)
+        return iou
 
     def matrix(self):
-        """Return the confusion matrix."""
         return self.matrix
 
-    def tp_fp(self):
-        """
-        Return true positives and false positives.
+    def plot(self, save_dir='.', names=None):
+        plt.figure(figsize=(10, 10))
+        sn.set(font_scale=1.2)
+        df_cm = pd.DataFrame(self.matrix, index=names, columns=names)
+        sn.heatmap(df_cm, annot=True, fmt='.0f', cmap='Blues')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        plt.savefig(Path(save_dir) / 'confusion_matrix.png')
+        plt.close()
 
-        Returns:
-            (tuple): True positives and false positives.
-        """
-        tp = self.matrix.diagonal()  # true positives
-        fp = self.matrix.sum(1) - tp  # false positives
-        # fn = self.matrix.sum(0) - tp  # false negatives (missed detections)
-        return (tp[:-1], fp[:-1]) if self.task == "detect" else (tp, fp)  # remove background class if task=detect
+    def print(self, names=None):
+        print("Confusion Matrix:")
+        if names:
+            print("Labels: ", names)
+        print(self.matrix)
+        
 
     @TryExcept(msg="ConfusionMatrix plot failure")
     @plt_settings()
